@@ -282,12 +282,19 @@ class Qwen3VLVLAModel(nn.Module):
 
         return vla
 
+    def train(self, mode=True):
+        super().train(mode)
+        for name in ("deform_encoder", "tactile_vqvae"):
+            module = getattr(self, name, None)
+            if module is not None and not any(p.requires_grad for p in module.parameters()):
+                module.eval()
+        return self
+
     def load_deform_encoder_weights(self, ckpt_path: str):
         if not self.use_tactile_deform:
             return
         if not os.path.exists(ckpt_path):
-            print(f"Warning: DeformEncoder checkpoint not found at {ckpt_path}")
-            return
+            raise FileNotFoundError(f"Frozen DeformEncoder requires a pretrained checkpoint: {ckpt_path}")
         print(f"Loading DeformEncoder weights from {ckpt_path} ...")
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         state_dict = checkpoint.get("state_dict", checkpoint)
@@ -297,9 +304,7 @@ class Qwen3VLVLAModel(nn.Module):
                 encoder_sd[k[len("encoder."):]] = v
             elif k in self.deform_encoder.state_dict():
                 encoder_sd[k] = v
-        missing, _ = self.deform_encoder.load_state_dict(encoder_sd, strict=False)
-        if missing:
-            print(f"  DeformEncoder missing keys: {missing}")
+        self.deform_encoder.load_state_dict(encoder_sd, strict=True)
         print("DeformEncoder weights loaded.")
 
     def load_tactile_vqvae(self, ckpt_path_or_blob, stats_hand=None):
