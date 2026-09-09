@@ -36,6 +36,7 @@ from utils.lerobot_common import (
 )
 
 import cv2  # for the tracking-error-noise rotation conversions
+from utils.flow_loss import action_padding_mask
 
 
 # ── state-noise helpers (mirror scripts/train.py) ────────────────────────────
@@ -136,8 +137,9 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
                 raise ValueError('F6 and DEFORM fingertip counts disagree')
             if n_fingers == 5 and self.has_deform and self.deform_keys not in (DEFORM_KEYS[:5], DEFORM_KEYS[5:]):
                 raise ValueError('Single-hand DEFORM features must contain one complete hand')
-            if self.use_tactile_vqvae and n_fingers != 10:
-                raise ValueError('Stock embedded VQ-VAE normalization expects ten fingers; disable use_tactile_vqvae for right-only data')
+            expected_fingers = 5 if self.action_dim == 31 else 10
+            if self.use_tactile_vqvae and n_fingers != expected_fingers:
+                raise ValueError('Embedded VQ-VAE fingertip count must match the model embodiment')
 
         # ── normalization stats (q01/q99 sidecar) ──
         self.stats_data = _stats if _stats is not None else load_norm_stats(root)
@@ -223,6 +225,10 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
 
         # ── actions + flow matching ──
         actions = np.stack([np.asarray(x[KEY_ACTION], dtype=np.float32) for x in batch], axis=0)  # [B,16,62]
+        chunk = int(getattr(cfg, 'action_chunk', actions.shape[1]))
+        if actions.shape != (B, chunk, self.action_dim):
+            raise ValueError('Dataset action shape does not match action_chunk/action_dim')
+        padding = action_padding_mask(batch, chunk)
         norm_actions = torch.tensor(
             _normalize(actions, self.action_mask, self.action_min, self.action_max),
             dtype=torch.bfloat16)
@@ -332,6 +338,7 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
             "target": u_t,
             "timesteps": time,
             "norm_actions": norm_actions,
+            "action_is_pad": padding,
             "tactile_f6s": norm_tacf6,
             "tactile_deforms": deforms_tensor,
             "tactile_f6s_delayed": norm_tacf6,            # delay_k=0 (parity with posttrain JSON path)

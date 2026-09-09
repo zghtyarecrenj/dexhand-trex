@@ -45,10 +45,11 @@ class CollectionLoaderTests(unittest.TestCase):
             self.assertEqual(loader.wrist_keys, [module.KEY_WRIST_R, module.KEY_WRIST_L])
             self.assertEqual(loader.deform_keys, module.DEFORM_KEYS)
 
-    def test_single_hand_rejects_stock_vqvae_normalization(self):
+    def test_single_hand_vqvae_uses_only_recorded_finger_history(self):
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, 'ten fingers'):
-                self.make_loader(directory, True, vqvae=True)
+            loader = self.make_loader(directory, True, vqvae=True)
+            self.assertEqual(len(loader.deform_keys), 5)
+            self.assertEqual(len(loader._build_delta_timestamps()[module.KEY_TACF6]), 16)
 
     def test_one_demonstration_cannot_leak_across_train_and_validation(self):
         segments = [{'segment_id': 0, 'source_index': 0}, {'segment_id': 1, 'source_index': 0}]

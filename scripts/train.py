@@ -45,6 +45,7 @@ from datasets import Dataset as HFDataset
 
 from qwen_vla import Qwen3VLVLAModel, extend_position_ids_for_flare, split_slow_fast_embeds
 import cv2
+from utils.flow_loss import action_padding_mask, masked_flow_mse
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
@@ -186,7 +187,7 @@ class SftDataset(Dataset):
             if not m:
                 continue
             ep_dir, frame = m.group(1), int(m.group(2))
-            f6 = np.asarray(s["tactile_f6"], dtype=np.float32).reshape(10, 6)
+            f6 = np.asarray(s["tactile_f6"], dtype=np.float32).reshape(-1, 6)
             by_ep.setdefault(ep_dir, []).append((frame, f6))
         for ep_dir, items in by_ep.items():
             items.sort(key=lambda t: t[0])
@@ -208,7 +209,7 @@ class SftDataset(Dataset):
         W = self.vqvae_window
         frame_re = re.compile(r"(.+/episode_\d+)/image(\d+)_")
         deforms = sample.get("tactile_image_deform", []) or []
-        cur = np.asarray(sample["tactile_f6"], dtype=np.float32).reshape(1, 10, 6)
+        cur = np.asarray(sample["tactile_f6"], dtype=np.float32).reshape(1, -1, 6)
         m = frame_re.search(deforms[0]) if deforms else None
         if m is None:
             return np.repeat(cur, W, axis=0)
@@ -238,11 +239,18 @@ class SftDataset(Dataset):
         """Split the dataset into train/val. Returns a new SftDataset for val."""
         import copy
         n = len(self.hf_dataset)
-        n_val = max(1, int(n * val_ratio))
-        rng = np.random.RandomState(seed)
-        perm = rng.permutation(n)
-        val_indices = sorted(perm[:n_val].tolist())
-        train_indices = sorted(perm[n_val:].tolist())
+        if "source_episode_id" in self.hf_dataset.column_names:
+            from qwen_vla.lerobot_dataset import split_episode_groups
+            groups = [{"segment_id": i, "source_index": source}
+                      for i, source in enumerate(self.hf_dataset["source_episode_id"])]
+            train_indices, val_indices = split_episode_groups(n, val_ratio, seed, groups)
+        else:
+            # Historical JSONs without source identity retain their old split.
+            n_val = max(1, int(n * val_ratio))
+            rng = np.random.RandomState(seed)
+            perm = rng.permutation(n)
+            val_indices = sorted(perm[:n_val].tolist())
+            train_indices = sorted(perm[n_val:].tolist())
 
         val_ds = copy.copy(self)
         val_ds.hf_dataset = self.hf_dataset.select(val_indices)
@@ -312,7 +320,9 @@ class SftDataset(Dataset):
         B = len(batch)
 
         actions = np.array([x["action"] for x in batch], dtype=np.float32)
-        actions = actions.reshape(B, -1, cfg.action_dim)
+        if actions.shape != (B, cfg.action_chunk, cfg.action_dim):
+            raise ValueError("Dataset action shape does not match action_chunk/action_dim")
+        padding = action_padding_mask(batch, cfg.action_chunk)
         norm_actions = self._normalize(actions, self.action_mask, self.action_min, self.action_max)
         norm_actions = torch.tensor(norm_actions, dtype=torch.bfloat16)
 
@@ -464,7 +474,8 @@ class SftDataset(Dataset):
             "noisy_actions": x_t,
             "target": u_t,
             "timesteps": time,
-            "norm_actions": norm_actions,            # for L_refine residual target
+            "norm_actions": norm_actions,
+            "action_is_pad": padding,
             "tactile_f6s": norm_tacf6,
             "tactile_deforms": deforms_tensor,
             "tactile_f6s_delayed": norm_tacf6,       # same as current (delay_k=0)
@@ -517,6 +528,8 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
                 "vqvae_codebook_size": getattr(args, "vqvae_codebook_size", 64),
                 "use_tactile_vqvae": getattr(args, "use_tactile_vqvae", 0),
                 "vqvae_config": getattr(args, "vqvae_config_dict", None),
+                "flow_loss": "valid_step_mean_squared_velocity",
+                "vqvae_stats_hand": args.vqvae_stats_hand,
                 "paradigm": "cascaded",
                 "cascaded_total_steps": getattr(args, "cascaded_total_steps", 10),
                 "cascaded_split_step":  getattr(args, "cascaded_split_step", 6),
@@ -631,9 +644,9 @@ def run_validation(model, val_dataloader, accelerator, args,
         chunk = args.action_chunk
         target = batch["target"].to(slow_embeds.dtype)
         n_fast = fast_embeds.shape[1]
-        has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform)
+        has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform or args.use_tactile_code or args.use_tactile_vqvae)
 
-        if has_any_tac:
+        if has_any_tac and not is_stage1:
             # Cascaded validation — full L_flow on action expert (τ ∈ [0, 1])
             # + L_flow_tactile on tactile expert at τ ∈ [0, τ_split].
             full_embeds = torch.cat([
@@ -650,7 +663,7 @@ def run_validation(model, val_dataloader, accelerator, args,
             hidden = outputs.last_hidden_state
             act_start = L_latent + n_fast + n_state + 1
             v_act = raw_model.final_layer(hidden[:, act_start:act_start + chunk, :])
-            loss_act = nn.MSELoss()(v_act, target)
+            loss_act = masked_flow_mse(v_act, target, batch.get("action_is_pad"))
 
             fe = fast_embeds if n_fast > 0 else None
             se = state_embeds if n_state > 0 else None
@@ -687,7 +700,7 @@ def run_validation(model, val_dataloader, accelerator, args,
                 tactile_codes=batch.get("tactile_codes"),
                 tactile_f6_history=batch.get("tactile_f6_history"),
             )
-            loss_tac = nn.MSELoss()(v_pred_r, v_target_r)
+            loss_tac = masked_flow_mse(v_pred_r, v_target_r, batch.get("action_is_pad"))
         else:
             # Stage-1 / tactile-free validation: action expert only.
             full_embeds = torch.cat([
@@ -704,7 +717,7 @@ def run_validation(model, val_dataloader, accelerator, args,
             hidden = outputs.last_hidden_state
             act_start = L_latent + n_fast + n_state + 1
             v_act = raw_model.final_layer(hidden[:, act_start:act_start + chunk, :])
-            loss_act = nn.MSELoss()(v_act, target)
+            loss_act = masked_flow_mse(v_act, target, batch.get("action_is_pad"))
             loss_tac = 0.0
 
         val_act += loss_act.item()
@@ -801,7 +814,7 @@ def train(args):
         model.load_deform_encoder_weights(args.deform_encoder_ckpt)
     model.initialize_vla_weights()
     if vqvae_blob is not None:
-        model.load_tactile_vqvae(vqvae_blob)
+        model.load_tactile_vqvae(vqvae_blob, stats_hand=args.vqvae_stats_hand)
     if args.use_flare:
         accelerator.print(
             f"Flare alignment: {args.n_flare_steps} steps × {args.n_flare_tokens_per_frame} tok/frame "
@@ -809,7 +822,7 @@ def train(args):
         )
 
     is_stage1 = (args.training_stage == 1)
-    has_any_tactile = bool(args.use_tactile_vec or args.use_tactile_deform)
+    has_any_tactile = bool(args.use_tactile_vec or args.use_tactile_deform or args.use_tactile_code or args.use_tactile_vqvae)
     freeze_tactile = not has_any_tactile
 
     if not args.resume_checkpoint:
@@ -834,12 +847,17 @@ def train(args):
         skipped = []
         for k, v in resume_sd.items():
             if k in model_sd and model_sd[k].shape != v.shape:
+                if k.startswith("tacf6_vqvae_"):
+                    raise ValueError("Resume VQ-VAE statistics have a different embodiment; load a standalone VQ-VAE with explicit hand statistics instead")
                 skipped.append(k)
             else:
                 filtered_sd[k] = v
         if skipped:
             accelerator.print(f"Skipped {len(skipped)} keys with shape mismatch (e.g. {skipped[0]})")
         missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
+        if args.use_tactile_vqvae and vqvae_blob is None and any(
+                k.startswith(("tactile_vqvae.", "tacf6_vqvae_")) for k in missing):
+            raise ValueError("Resume checkpoint does not contain complete VQ-VAE weights and normalization")
         accelerator.print(f"Resumed: missing={len(missing)}, unexpected={len(unexpected)}")
 
     resumed_tactile = bool(args.resume_checkpoint) and args.resume_source == "midtrain"
@@ -1010,7 +1028,7 @@ def train(args):
             n_fast = fast_embeds.shape[1]
             r_target_norm = None  # set only when tactile expert ran this step
 
-            has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform)
+            has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform or args.use_tactile_code or args.use_tactile_vqvae)
 
             # Cascaded: shared flow split between action + tactile experts.
             # 1) L_flow — action expert single-step (tactile-blind), trained on
@@ -1035,7 +1053,7 @@ def train(args):
             act_pred_start = L_latent + n_fast + n_state + 1
             v_act = raw_model.final_layer(
                 hidden[:, act_pred_start: act_pred_start + chunk, :])
-            loss_act = nn.MSELoss()(v_act, target)
+            loss_act = masked_flow_mse(v_act, target, batch.get("action_is_pad"))
 
             if has_any_tac and not is_stage1:
                 fe = fast_embeds if n_fast > 0 else None
@@ -1098,7 +1116,7 @@ def train(args):
                         # Zero raw F6 → a consistent "no-contact" code on encode.
                         tac_hist_in = torch.zeros_like(tac_hist_in)
 
-                loss_tac = nn.MSELoss()(
+                loss_tac = masked_flow_mse(
                     raw_model.tactile_flow_train_step(
                         cached_kv=cached_kv,
                         latent_position_ids=pos_ids,
@@ -1110,7 +1128,7 @@ def train(args):
                         tactile_codes=tac_codes_in,
                         tactile_f6_history=tac_hist_in,
                     ),
-                    v_target_r,
+                    v_target_r, batch.get("action_is_pad"),
                 )
             else:
                 loss_tac = 0.0
@@ -1306,6 +1324,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_tactile_vqvae", type=int, default=0,
                         help="1: embed the VQ-VAE in the model and tokenize raw "
                              "F6 history on-the-fly (implies use_tactile_code).")
+    parser.add_argument("--vqvae_stats_hand", choices=["left", "right"], default=None,
+                        help="Explicit hand selection when loading 60-channel VQ-VAE stats into a 31D model.")
     parser.add_argument("--vqvae_ckpt", type=str, default="",
                         help="Standalone VQ-VAE checkpoint (config/model_state/stats) "
                              "to load into the embedded module.")
@@ -1337,4 +1357,3 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
 
     train(args)
-

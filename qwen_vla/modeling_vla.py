@@ -134,14 +134,16 @@ class Qwen3VLVLAModel(nn.Module):
             self.tactile_vqvae.eval()
             for p in self.tactile_vqvae.parameters():
                 p.requires_grad = False
-            # F6 min-max normalization stats ([60] = 10 fingers × 6 dims),
-            # registered as buffers so they travel with the checkpoint.
+            # Native single-arm (31D) and historical bimanual embodiments.
+            # Buffers travel with the checkpoint; never invent absent fingers.
+            self.tactile_n_fingers = 5 if action_dim == 31 else 10
+            f6_width = self.tactile_n_fingers * 6
             self.register_buffer("tacf6_vqvae_min",
-                                 torch.zeros(60, dtype=torch.float32), persistent=True)
+                                 torch.zeros(f6_width, dtype=torch.float32), persistent=True)
             self.register_buffer("tacf6_vqvae_max",
-                                 torch.ones(60, dtype=torch.float32), persistent=True)
+                                 torch.ones(f6_width, dtype=torch.float32), persistent=True)
             self.register_buffer("tacf6_vqvae_mask",
-                                 torch.ones(60, dtype=torch.bool), persistent=True)
+                                 torch.ones(f6_width, dtype=torch.bool), persistent=True)
 
         if use_robot_state:
             self.state_embedder = ActionEmbedder(action_dim, H)
@@ -300,7 +302,7 @@ class Qwen3VLVLAModel(nn.Module):
             print(f"  DeformEncoder missing keys: {missing}")
         print("DeformEncoder weights loaded.")
 
-    def load_tactile_vqvae(self, ckpt_path_or_blob):
+    def load_tactile_vqvae(self, ckpt_path_or_blob, stats_hand=None):
         """Load weights + F6 normalization stats into the embedded VQ-VAE.
 
         Accepts either a path to a standalone VQ-VAE checkpoint (the
@@ -313,16 +315,24 @@ class Qwen3VLVLAModel(nn.Module):
         blob = ckpt_path_or_blob
         if isinstance(blob, str):
             blob = torch.load(blob, map_location="cpu", weights_only=False)
-        missing, unexpected = self.tactile_vqvae.load_state_dict(
-            blob["model_state"], strict=False)
-        if missing:
-            print(f"  [tactile_vqvae] missing keys: {missing[:6]} ...")
-        if unexpected:
-            print(f"  [tactile_vqvae] unexpected keys: {unexpected[:6]} ...")
         stats = blob["stats"]
-        self.tacf6_vqvae_min.copy_(torch.as_tensor(stats["tacf6_min"], dtype=torch.float32))
-        self.tacf6_vqvae_max.copy_(torch.as_tensor(stats["tacf6_max"], dtype=torch.float32))
-        self.tacf6_vqvae_mask.copy_(torch.as_tensor(stats["tacf6_mask"], dtype=torch.bool))
+        values = [torch.as_tensor(stats[key], dtype=dtype)
+                  for key, dtype in [("tacf6_min", torch.float32),
+                                     ("tacf6_max", torch.float32),
+                                     ("tacf6_mask", torch.bool)]]
+        width = self.tacf6_vqvae_min.numel()
+        if width == 30 and all(v.shape == (60,) for v in values):
+            if stats_hand not in ("left", "right"):
+                raise ValueError("Loading bimanual VQ-VAE stats into a single-hand model requires stats_hand='left' or 'right'")
+            offset = 0 if stats_hand == "left" else 30
+            values = [v[offset:offset+30] for v in values]
+        if any(v.shape != (width,) for v in values):
+            raise ValueError(f"VQ-VAE normalization must supply {width} channels for this embodiment")
+        if not torch.isfinite(values[0]).all() or not torch.isfinite(values[1]).all() or (values[1] < values[0]).any():
+            raise ValueError("Invalid VQ-VAE normalization ranges")
+        self.tactile_vqvae.load_state_dict(blob["model_state"], strict=True)
+        for name, value in zip(("tacf6_vqvae_min", "tacf6_vqvae_max", "tacf6_vqvae_mask"), values):
+            getattr(self, name).copy_(value)
         self.tactile_vqvae.eval()
         for p in self.tactile_vqvae.parameters():
             p.requires_grad = False
@@ -335,7 +345,7 @@ class Qwen3VLVLAModel(nn.Module):
     def encode_tactile_f6_history(self, f6_history_raw: torch.Tensor) -> torch.Tensor:
         """Encode a raw (un-normalized) F6 history window into per-hand codes.
 
-        f6_history_raw : [B, T, 10, 6]  (two hands × 5 fingers; T = VQ-VAE window).
+        f6_history_raw : [B, T, NF, 6] (NF=5 for 31D, NF=10 for bimanual).
                          Normalized internally with the embedded VQ-VAE stats,
                          so callers pass raw F6 — exactly what the dataloader /
                          robot reads off the sensor.
@@ -350,8 +360,13 @@ class Qwen3VLVLAModel(nn.Module):
         if self.tactile_vqvae is None:
             raise RuntimeError("encode_tactile_f6_history requires use_tactile_vqvae.")
         vq = self.tactile_vqvae
+        vq.eval()
         w_dtype = next(vq.parameters()).dtype
         x = f6_history_raw.to(device=self.tacf6_vqvae_min.device, dtype=torch.float32)
+        if x.ndim != 4 or x.shape[2:] != (self.tactile_n_fingers, 6):
+            raise ValueError("F6 history must match the model's actual fingertip count")
+        if x.shape[1] != vq.cfg.window:
+            raise ValueError("F6 history length must match the VQ-VAE window")
         B, T, NF, D = x.shape
         # Min-max normalize to [-1, 1] (matches TacF6Stats.normalize).
         flat = x.reshape(B, T, NF * D)                                  # [B, T, 60]
