@@ -72,6 +72,25 @@ def _normalize(values, mask, vmin, vmax):
     return np.where(mask, np.clip(2 * (values - vmin) / (vmax - vmin + 1e-8) - 1, -1, 1), values)
 
 
+def split_episode_groups(n_ep, val_ratio, seed, segments=None):
+    """Keep all fragments of one original demonstration in the same split."""
+    if not 0 < val_ratio < 1:
+        raise ValueError('val_ratio must be between zero and one')
+    groups = {i: i for i in range(n_ep)}
+    if segments is not None:
+        groups = {int(s['segment_id']): int(s['source_index']) for s in segments}
+        if set(groups) != set(range(n_ep)):
+            raise ValueError('Collection segment metadata does not cover all episodes')
+    source_ids = sorted(set(groups.values()))
+    if len(source_ids) < 2:
+        raise ValueError('Train/validation splitting requires at least two independent source demonstrations')
+    perm = np.random.RandomState(seed).permutation(source_ids)
+    n_val = min(len(source_ids)-1, max(1, int(len(source_ids)*val_ratio)))
+    val_sources = set(perm[:n_val].tolist())
+    return (sorted(i for i, source in groups.items() if source not in val_sources),
+            sorted(i for i, source in groups.items() if source in val_sources))
+
+
 class TRexLeRobotDataset(torch.utils.data.Dataset):
     def __init__(self, config, processor, accelerator, episodes: Optional[List[int]] = None,
                  _ds=None, _stats=None):
@@ -88,9 +107,13 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
             info = json.load(f)
         self.fps = int(info["fps"])
         feats = info["features"]
-        self.has_wrist   = KEY_WRIST_R in feats and KEY_WRIST_L in feats
+        # A single-arm collection must not fabricate a second wrist/hand.
+        # Preserve the historical right-then-left camera order when both exist.
+        self.wrist_keys = [key for key in (KEY_WRIST_R, KEY_WRIST_L) if key in feats]
+        self.has_wrist = bool(self.wrist_keys)
         self.has_tactile = KEY_TACF6 in feats
-        self.has_deform  = DEFORM_KEYS[0] in feats
+        self.deform_keys = [key for key in DEFORM_KEYS if key in feats]
+        self.has_deform = bool(self.deform_keys)
 
         # flow / flare / tactile config (mirror SftDataset)
         self.image_size = tuple(config.image_size) if getattr(config, "image_size", None) else None
@@ -103,6 +126,18 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
         self.use_robot_state = bool(getattr(config, "use_robot_state", 0))
         self.vqvae_window = int(getattr(config, "vqvae_window", 16))
         self.action_dim = int(getattr(config, "action_dim", ACTION_DIM))
+        if list(feats[KEY_STATE]['shape']) != [self.action_dim] or feats[KEY_ACTION]['shape'][-1] != self.action_dim:
+            raise ValueError('Configured action_dim does not match dataset state/action dimensions')
+        if self.has_tactile:
+            n_fingers = feats[KEY_TACF6]['shape'][0]
+            if n_fingers not in (5, 10) or feats[KEY_TACF6]['shape'][-1] != 6:
+                raise ValueError('Expected five or ten fingertip six-axis wrenches')
+            if self.has_deform and len(self.deform_keys) != n_fingers:
+                raise ValueError('F6 and DEFORM fingertip counts disagree')
+            if n_fingers == 5 and self.has_deform and self.deform_keys not in (DEFORM_KEYS[:5], DEFORM_KEYS[5:]):
+                raise ValueError('Single-hand DEFORM features must contain one complete hand')
+            if self.use_tactile_vqvae and n_fingers != 10:
+                raise ValueError('Stock embedded VQ-VAE normalization expects ten fingers; disable use_tactile_vqvae for right-only data')
 
         # ── normalization stats (q01/q99 sidecar) ──
         self.stats_data = _stats if _stats is not None else load_norm_stats(root)
@@ -156,11 +191,12 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
         """Split by episode index; returns a val TRexLeRobotDataset (shares stats)."""
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         n_ep = self.ds.meta.total_episodes
-        rng = np.random.RandomState(seed)
-        perm = rng.permutation(n_ep)
-        n_val = max(1, int(n_ep * val_ratio))
-        val_eps = sorted(perm[:n_val].tolist())
-        train_eps = sorted(perm[n_val:].tolist())
+        segment_file = os.path.join(self.root, 'meta', 'collection_segments.json')
+        segments = None
+        if os.path.isfile(segment_file):
+            with open(segment_file) as stream:
+                segments = json.load(stream)
+        train_eps, val_eps = split_episode_groups(n_ep, val_ratio, seed, segments)
         repo_id = getattr(self.config, "lerobot_repo_id", "") or os.path.basename(self.root.rstrip("/"))
         dt = self._build_delta_timestamps()
         val_ds = LeRobotDataset(repo_id, root=self.root, episodes=val_eps, delta_timestamps=dt)
@@ -217,7 +253,7 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
             # each deform key is [3,H,W] float[0,1]; take channel 0 → [H,W].
             per_sample = []
             for x in batch:
-                fingers = [x[k][0] for k in DEFORM_KEYS]      # 10 × [H,W]
+                fingers = [x[k][0] for k in self.deform_keys]
                 per_sample.append(torch.stack(fingers, dim=0))  # [10,H,W]
             deforms_tensor = torch.stack(per_sample, dim=0).unsqueeze(2).float()  # [B,10,1,H,W]
 
@@ -240,7 +276,7 @@ class TRexLeRobotDataset(torch.utils.data.Dataset):
             pil_slow = [self._img_to_pil(head_seq[0])]
             pil_fast = []
             if self.has_wrist:
-                pil_fast = [self._img_to_pil(x[KEY_WRIST_R]), self._img_to_pil(x[KEY_WRIST_L])]
+                pil_fast = [self._img_to_pil(x[key]) for key in self.wrist_keys]
             all_pil = pil_slow + pil_fast
             content = [{"type": "image"} for _ in pil_slow]
             content.append({"type": "text", "text": x.get("task", "")})
