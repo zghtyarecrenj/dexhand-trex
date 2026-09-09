@@ -73,6 +73,12 @@ class SingleProcessTests(unittest.TestCase):
             model.load_deform_encoder_weights(str(path))
 
     def test_two_optimizer_steps_validation_and_checkpoint_on_cpu(self):
+        self._exercise_training(accumulation=1, batch_size=2)
+
+    def test_accumulation_flushes_short_final_group_with_activation_checkpointing(self):
+        self._exercise_training(accumulation=2, batch_size=1)
+
+    def _exercise_training(self, accumulation, batch_size):
         model = small_model()
         # Synthetic vision embeddings; the MoT and both expert heads are real.
         model.prepare_inputs_embeds = MethodType(
@@ -87,7 +93,8 @@ class SingleProcessTests(unittest.TestCase):
                 '--action_dim', '31', '--action_chunk', '16', '--image_size', '640', '360',
                 '--use_robot_state', '1', '--use_tactile_vec', '1',
                 '--use_tactile_deform', '0', '--use_flare', '0',
-                '--n_epochs', '3', '--num_workers', '0', '--train_bsz_per_gpu', '2',
+                '--n_epochs', '3', '--num_workers', '0', '--train_bsz_per_gpu', str(batch_size),
+                '--gradient_accumulation_steps', str(accumulation), '--gradient_checkpointing', '1',
                 '--max_steps', '2', '--val_ratio', '.1', '--val_freq', '2',
                 '--cascaded_total_steps', '2', '--cascaded_split_step', '1'])
             before = model.final_layer.mlp.fc2.weight.detach().clone()

@@ -27,6 +27,7 @@ Weight loading:
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -635,7 +636,8 @@ class Qwen3VLModelMoT(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+                    and past_key_values is None):
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
