@@ -37,6 +37,7 @@ args = trainer.build_parser().parse_args([
 with patch.object(trainer.Qwen3VLVLAModel, 'from_pretrained_qwen3vl', return_value=model), \
      patch.object(trainer.AutoProcessor, 'from_pretrained', return_value=proc), \
      patch.object(trainer, 'SftDataset', TinyDataset), \
+     patch.object(trainer, 'enable_qwen_patch_channels_last', return_value=0), \
      patch.object(trainer.wandb, 'init'), patch.object(trainer.wandb, 'log'):
     trainer.train(args)
 import torch.distributed as dist

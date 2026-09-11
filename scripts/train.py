@@ -49,6 +49,7 @@ import cv2
 from utils.flow_loss import action_padding_mask, masked_flow_mse
 from utils.checkpoint_transfer import transfer_state
 from utils.training_runtime import PolicyLossModule, wrap_fsdp, policy_state_dict, clip_grad_norm
+from utils.qwen_patch_layout import enable_qwen_patch_channels_last
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
@@ -701,6 +702,8 @@ def train(args):
     if args.use_tactile_deform and not args.init_checkpoint:
         model.load_deform_encoder_weights(args.deform_encoder_ckpt)
     model.initialize_vla_weights()
+    patch_count = enable_qwen_patch_channels_last(model)
+    accelerator.print(f"[Performance] channels_last_3d enabled for {patch_count} Qwen patch embedding(s)")
     if vqvae_blob is not None:
         model.load_tactile_vqvae(vqvae_blob, stats_hand=args.vqvae_stats_hand)
     if args.use_flare:
