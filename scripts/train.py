@@ -50,6 +50,7 @@ from utils.flow_loss import action_padding_mask, masked_flow_mse
 from utils.checkpoint_transfer import transfer_state
 from utils.training_runtime import PolicyLossModule, wrap_fsdp, policy_state_dict, clip_grad_norm
 from utils.qwen_patch_layout import enable_qwen_patch_channels_last
+from utils.preprocessing_metadata import capture_preprocessing, write_preprocessing
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
@@ -505,6 +506,7 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
             shutil.rmtree(os.path.join(args.output_dir, oldest))
 
         os.makedirs(save_dir, exist_ok=True)
+        write_preprocessing(save_dir,getattr(args,'image_preprocessing',None))
 
         torch.save(sd, os.path.join(save_dir, "model.pt"))
 
@@ -518,6 +520,7 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
             json.dump({
                 "model_path": args.model_path,
                 "image_size": args.image_size,
+                "image_preprocessing": getattr(args,'image_preprocessing',None),
                 "distributed_backend": args.distributed_backend,
                 "gradient_checkpointing": args.gradient_checkpointing,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
@@ -609,6 +612,8 @@ def run_validation(model, val_dataloader, accelerator, args, *unused):
 def train(args):
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Choose either official initialization or a compatible right-only resume")
+    # Snapshot once: later edits to the dataset's sidecar cannot relabel this run.
+    args.image_preprocessing=capture_preprocessing(args)
     accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_plugin=GradientAccumulationPlugin(

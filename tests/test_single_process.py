@@ -90,6 +90,7 @@ class SingleProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = trainer.build_parser().parse_args([
                 '--model_path', tmp, '--output_dir', tmp, '--log_dir', tmp,
+                '--data_path',str(Path(tmp)/'train.json'),
                 '--action_dim', '31', '--action_chunk', '16', '--image_size', '640', '360',
                 '--use_robot_state', '1', '--use_tactile_vec', '1',
                 '--use_tactile_deform', '0', '--use_flare', '0',
@@ -97,6 +98,10 @@ class SingleProcessTests(unittest.TestCase):
                 '--gradient_accumulation_steps', str(accumulation), '--gradient_checkpointing', '1',
                 '--max_steps', '2', '--val_ratio', '.1', '--val_freq', '2',
                 '--cascaded_total_steps', '2', '--cascaded_split_step', '1'])
+            crop=dict(schema='collection_camera_crop',version=1,coordinate_space='raw_camera_pixels',
+                      resize='letterbox_inter_area',cameras={'camera:wrist_right':{
+                          'source_size':[640,480],'roi':[100,80,400,300]}})
+            (Path(tmp)/'image_preprocessing.json').write_text(json.dumps(crop))
             before = model.final_layer.mlp.fc2.weight.detach().clone()
             with patch.object(trainer, 'Accelerator', side_effect=lambda **kw: Accelerator(cpu=True, **kw)), \
                  patch.object(trainer.Qwen3VLVLAModel, 'from_pretrained_qwen3vl', return_value=model), \
@@ -108,6 +113,8 @@ class SingleProcessTests(unittest.TestCase):
             ckpt = Path(tmp)/'checkpoint-0-2'
             self.assertTrue((ckpt/'model.pt').is_file())
             self.assertEqual(json.loads((ckpt/'training_args.json').read_text())['image_size'], [640, 360])
+            self.assertEqual(json.loads((ckpt/'training_args.json').read_text())['image_preprocessing'],crop)
+            self.assertEqual(json.loads((ckpt/'image_preprocessing.json').read_text()),crop)
             self.assertFalse(torch.equal(before, model.final_layer.mlp.fc2.weight))
             self.assertTrue(any('val/action_loss' in c.args[0] for c in log.call_args_list))
             self.assertTrue(all(torch.isfinite(p).all() for p in model.parameters()))
