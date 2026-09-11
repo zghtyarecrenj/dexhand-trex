@@ -10,6 +10,17 @@ from utils.preprocessing_metadata import capture_preprocessing,write_preprocessi
 
 
 class PreprocessingTests(unittest.TestCase):
+    def test_per_camera_sizes_reject_accidental_common_resize(self):
+        config=dict(schema='collection_camera_crop',version=2,coordinate_space='raw_camera_pixels',
+                    resize='letterbox_inter_area',cameras={},output_sizes={
+                        'camera:realsense_color':[640,384],'camera:wrist_right':[384,384]})
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'image_preprocessing.json').write_text(json.dumps(config))
+            args=SimpleNamespace(data_format='json',data_path=str(root/'train.json'),image_size=None)
+            self.assertEqual(capture_preprocessing(args),config)
+            args.image_size=[640,360]
+            with self.assertRaisesRegex(ValueError,'--image_size'):capture_preprocessing(args)
+
     def test_json_and_lerobot_snapshot_survives_source_edits(self):
         config=dict(schema='collection_camera_crop',version=1,coordinate_space='raw_camera_pixels',
                     resize='letterbox_inter_area',cameras={'camera:wrist_right':{
