@@ -20,7 +20,7 @@ def small_model(dim=31, vqvae=False, granularity='hand', deform=False):
     return model
 
 
-def check_cascaded_backward(actions, f6, padding, deforms=None):
+def check_cascaded_backward(actions, f6, padding, deforms=None, supervision=None):
     """Actual MoT, both velocity heads, cache flow and optimizer; synthetic vision tokens."""
     torch.manual_seed(7)
     model = small_model(deform=deforms is not None).to(torch.bfloat16)
@@ -43,7 +43,7 @@ def check_cascaded_backward(actions, f6, padding, deforms=None):
         tactile_indexes=torch.arange(0))
     action_prediction = model.final_layer(out.last_hidden_state[:,-chunk:])
     action_prediction.retain_grad()
-    loss_action = masked_flow_mse(action_prediction, noise-actions, padding)
+    loss_action = masked_flow_mse(action_prediction, noise-actions, padding, supervision)
     with torch.no_grad():
         _, cache, count, _ = model.forward_flow_action_partial(latent, positions, noise,
             fast_embeds=wrist, state_embeds=state, num_steps_total=2, split_step=1)
@@ -51,12 +51,14 @@ def check_cascaded_backward(actions, f6, padding, deforms=None):
         .2 * noise + .8 * actions, torch.full((batch,), .2),
         tactile_f6=f6, tactile_deform=deforms)
     tactile_prediction.retain_grad()
-    loss_tactile = masked_flow_mse(tactile_prediction, noise-actions, padding)
+    loss_tactile = masked_flow_mse(tactile_prediction, noise-actions, padding, supervision)
     (loss_action + loss_tactile).backward()
     for predicted in (action_prediction, tactile_prediction):
         assert predicted.shape == (batch,chunk,width)
         assert torch.count_nonzero(predicted.grad[padding]) == 0
         assert torch.count_nonzero(predicted.grad[~padding]) > 0
+        if supervision is not None:
+            assert torch.count_nonzero(predicted.grad[~supervision]) == 0
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(g).all() for g in grads)
     for head in (model.final_layer, model.final_layer_tactile, model.tacf6_embedder):

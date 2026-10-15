@@ -1,0 +1,90 @@
+T-Rex successful-continuous DAgger training handoff — 2026-10-15
+
+Objective
+Fine-tune a compatible right-only T-Rex checkpoint on oct14_15_success_continuous_v4: 123 operator-confirmed successful episodes, 65,810 observations, 63,933 valid action frames and 1,877 masked handoff-context frames. Preserve continuous future chunks across human/policy ownership changes. No training has been launched.
+
+Repository / branch / revision
+T-Rex fork remote: git@github.com:zghtyarecrenj/dexhand-trex.git
+Local branch: collection/development
+Base HEAD: 0e85749bb1e8c8fc8344ac084464bc19a2bbf2d3
+Parent pipeline: git@github.com:zghtyarecrenj/dexhand-pipeline.git
+Parent HEAD: 85976b32d5cf5ca3eb874d00239f4cdc62dd1152
+The DAgger changes are published on collection/development after the base revision above. Record git rev-parse HEAD for each training run. The paired pipeline commit pins the exact T-Rex revision and contains the updated statistics helper. This guide is included in the T-Rex change itself; the base HEAD is not the new training revision.
+
+Implementation
+external/trex/scripts/train.py: JSON collator carries boolean action_is_pad [B,16] and expands action_supervision_mask [31] to [B,16,31]. Existing source_episode_id grouping keeps segments from one recording in one split.
+external/trex/utils/flow_loss.py: masked_flow_mse excludes arbitrary padded steps and disabled axes, with a denominator counting valid scalar targets; handles all-masked batches.
+external/trex/utils/training_runtime.py: both action and tactile-expert action losses receive the masks.
+external/trex/utils/lerobot_common.py: supervised_action_stats excludes invalid steps and disabled axes.
+training/trex/prepare_stats.py (parent repo): train-source-only normalization with matching masks.
+Regression coverage also includes utils/training_smoke.py, tests/test_right_only_training.py and tests/test_partial_supervision.py.
+The uploaded export includes source_snapshot/ for provenance. The published trainer additionally clarifies mask documentation and tests internal handoff gaps in both model heads. Use the published source; do not overwrite it with older snapshots.
+
+Contract for THIS export (different from the earlier expert-only export)
+- Use trex/train.json, 31 action dimensions, 16-step chunks at 30 Hz.
+- action_supervision_mask is all true: train all 31 valid executed-action axes, including policy actions after interventions and policy hand commands during G.
+- human_supervision_mask [16,31] records ownership: F = arm+hand, G = arm only. It is provenance, NOT the loss mask in this baseline. Do not substitute it for action_supervision_mask or filter to human-only rows.
+- action_is_pad=True means temporal padding OR an invalid handoff action target. It can contain internal holes. Preserve later valid steps; never truncate the chunk at its first true value. Placeholders are not expert action labels.
+- For both losses, valid = (~action_is_pad)[...,None] & action_supervision_mask. Compute sum of squared velocity error only at valid entries, divided by max(number of valid scalar entries,1).
+- Train/validation split must group by source_episode_id, not segment or row; use the same seed and ratio for statistics and training.
+- Keep image_preprocessing.json beside train.json. Preserve dataset-native per-view dimensions and do not recrop exported images. Preserve the checkpoint's modality, state and action conventions.
+- Earlier expert-only README text says G hand targets are excluded. That applies when the dataset's axis mask disables them; it does NOT describe this successful-continuous export, whose mask enables them.
+
+Normalization and checkpoint initialization
+For a warm-start comparison, keep the compatible deployed checkpoint's stats_data.json as the explicit --stats_path; changing normalization changes the numerical meaning of its learned action/state mappings. Preserve these same statistics at deployment via the saved checkpoint. This is a choice for the experiment, not an exporter requirement.
+If intentionally refitting normalization, fit only training sources with the masked prepare_stats.py; never use all-source train_statistics.json by accident. For example, from the pipeline root in the configured training environment:
+  python training/trex/prepare_stats.py --data "$DAGGER_DATA/trex/train.json" --output "$DAGGER_STATS" --seed 42 --val-ratio 0.1
+Set DAGGER_STATS to a new experiment file for refitting, never to the original checkpoint statistics. Retain the generated split report. Applying new scaling to an existing checkpoint requires deliberate validation; it is not numerically equivalent to continuing its old training.
+
+Server setup and smoke launch
+Use an existing compatible training environment (the pipeline B300 setup uses Python 3.10, Torch 2.9.1/CUDA 13.0 and Transformers 4.57.3). The data archive does not include the full environment or policy weights. For a new server, use training/trex/README.md and setup_b300.sh in the pipeline fork. Do not install upstream requirements over that environment blindly.
+
+With your own GitHub authentication, clone or update the collection/development branch of zghtyarecrenj/dexhand-trex. For the paired launcher/statistics helper, clone zghtyarecrenj/dexhand-pipeline at collection/development and initialize its pinned external/trex submodule; do not use submodule update --remote. On an existing checkout preserve local work before updating.
+
+Download all 346 parts, parts_manifest.json and reassemble.py from the dataset folder:
+https://drive.google.com/drive/folders/1M_5dm6HCMkpBtqqN8Z709s77XLdYVZkv
+Run python3 reassemble.py, then tar -xzf oct14_15_success_continuous_v4.tar.gz. Allow about 110 GB for parts, archive and extraction. Read USAGE.txt and the validation reports.
+
+From the T-Rex repository root, activate the compatible training environment and set server-local absolute paths:
+  export DAGGER_DATA=/path/to/oct14_15_success_continuous_v4
+  export DAGGER_CHECKPOINT=/path/to/compatible_31d_checkpoint
+  export DAGGER_STATS="$DAGGER_CHECKPOINT/stats_data.json"
+  export DAGGER_QWEN=/path/to/Qwen3-VL-2B-Instruct
+  export DAGGER_DEFORM=/path/to/standard_deform.pth
+  export DAGGER_OUTPUT=/path/to/new/dagger_training_runs
+  export PYTHONPATH="$PWD"
+  export WANDB_MODE=offline
+
+For the matching F6+deformation, state-enabled checkpoint, run:
+  python scripts/train.py \
+    --model_path "$DAGGER_QWEN" --data_format json \
+    --data_path "$DAGGER_DATA/trex/train.json" --stats_path "$DAGGER_STATS" \
+    --resume_checkpoint "$DAGGER_CHECKPOINT" --resume_source midtrain \
+    --output_dir "$DAGGER_OUTPUT" --log_dir "$DAGGER_OUTPUT/logs" \
+    --experiment_name dagger_success_v4 --run_name smoke \
+    --action_dim 31 --action_chunk 16 --use_robot_state 1 \
+    --use_tactile_vec 1 --use_tactile_deform 1 --deform_encoder_ckpt "$DAGGER_DEFORM" \
+    --use_tactile_vqvae 0 --use_flare 0 --tactile_intermediate_size 1536 \
+    --training_stage 2 --cascaded_total_steps 10 --cascaded_split_step 6 \
+    --distributed_backend none --gradient_checkpointing 1 \
+    --train_bsz_per_gpu 1 --gradient_accumulation_steps 4 \
+    --n_epochs 20 --learning_rate 1e-5 --weight_decay 0.01 \
+    --warmup_rates 0.03 --max_grad_norm 1 --save_freq 1 --max_ckpts 3 \
+    --seed 42 --val_ratio 0.1 --max_steps 10 --val_freq 10 \
+    --max_val_batches 2 --num_workers 0
+
+Match modalities and model configuration to the checkpoint's training_args.json. Do not add --image_size: preserve the exported per-view crop dimensions. --resume_source midtrain preserves the trained tactile expert. This warm-starts weights; it does not resume optimizer/scheduler/RNG state.
+
+After finite-loss/backward/checkpoint checks pass, use a new run name, remove --max_steps 10, choose a deliberate epoch/update budget, and set suitable validation frequency/workers. The shown LR and epoch defaults are starting settings, not a tuned DAgger recipe. Evaluate against the same baseline task protocol; a lower SFT loss is not evidence of improved robot success. This is successful-trajectory uniform SFT, with no human-ownership weighting, progress classifier or failure learning.
+
+If adding original demonstrations later, build an explicit combined manifest with globally unique source IDs and valid media paths; keep each source in one split and choose sampling ratios deliberately. Simply concatenating JSON with conflicting relative paths or source IDs is unsafe. The supplied smoke command uses only the successful DAgger export.
+
+Checks / remaining limits / next action
+- Export readback: all action targets and masks checked; 156 source-pixel comparisons passed.
+- Internal-hole gradient check passed: masked steps have zero direct loss gradient; later policy targets have nonzero gradients.
+- tests/test_partial_supervision.py: 4 passed (2026-10-15), including internal holes and continuation gradients.
+- tests/test_right_only_training.py: 12 passed, including actual small-model backward through both heads.
+- tests/test_single_process.py: 4 passed, including optimization, validation and checkpoint saving on a tiny CPU model.
+- Full GPU training, held-out improvement and closed-loop robot success remain untested.
+- First run the server smoke check and inspect finite losses, masks, normalization and saved checkpoint settings. Evaluate the new policy against the same baseline protocol before drawing a success conclusion.
+- The paired pipeline pin, lock and provenance identify the published training code. Training and robot evaluation remain separate operator actions.

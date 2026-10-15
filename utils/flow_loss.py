@@ -1,4 +1,4 @@
-"""Flow supervision for any action width, excluding artificial chunk tails."""
+"""Flow supervision for any action width, excluding invalid steps and disabled axes."""
 import torch
 
 
@@ -13,7 +13,21 @@ def action_padding_mask(batch, chunk):
     return torch.stack(masks)
 
 
-def masked_flow_mse(prediction, target, action_is_pad=None):
+def action_supervision_mask(batch, chunk, width):
+    """Expand dataset loss-axis selection; legacy rows supervise every axis."""
+    masks = []
+    for row in batch:
+        value = row.get('action_supervision_mask')
+        # Arrow fills missing fields with null when legacy demonstrations and
+        # new correction rows are combined into one dataset.
+        mask = torch.as_tensor([True]*width if value is None else value)
+        if mask.dtype != torch.bool or mask.shape != (width,):
+            raise ValueError('action_supervision_mask must be a boolean vector of length action_dim')
+        masks.append(mask.expand(chunk, width))
+    return torch.stack(masks)
+
+
+def masked_flow_mse(prediction, target, action_is_pad=None, action_supervision_mask=None):
     """Mean squared velocity error over recorded steps and actual action axes.
 
     Both experts use this same objective. A right-only model supplies 31 axes;
@@ -27,6 +41,11 @@ def masked_flow_mse(prediction, target, action_is_pad=None):
         if action_is_pad.dtype != torch.bool or action_is_pad.shape != prediction.shape[:2]:
             raise ValueError('action_is_pad must have boolean [B,T] shape')
         valid = ~action_is_pad.to(prediction.device)
-    error = torch.where(valid.unsqueeze(-1), prediction.float() - target.float(), 0.)
-    count = valid.sum().float() * prediction.shape[-1]
+    valid = valid.unsqueeze(-1).expand_as(prediction)
+    if action_supervision_mask is not None:
+        if action_supervision_mask.dtype != torch.bool or action_supervision_mask.shape != prediction.shape:
+            raise ValueError('action_supervision_mask must have boolean [B,T,D] shape')
+        valid = valid & action_supervision_mask.to(prediction.device)
+    error = torch.where(valid, prediction.float() - target.float(), 0.)
+    count = valid.sum().float()
     return error.square().sum() / count.clamp_min(1.)

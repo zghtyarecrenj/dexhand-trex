@@ -46,7 +46,7 @@ from datasets import Dataset as HFDataset
 
 from qwen_vla import Qwen3VLVLAModel, extend_position_ids_for_flare, split_slow_fast_embeds
 import cv2
-from utils.flow_loss import action_padding_mask, masked_flow_mse
+from utils.flow_loss import action_padding_mask, action_supervision_mask, masked_flow_mse
 from utils.checkpoint_transfer import transfer_state
 from utils.training_runtime import PolicyLossModule, wrap_fsdp, policy_state_dict, clip_grad_norm
 from utils.qwen_patch_layout import enable_qwen_patch_channels_last
@@ -328,6 +328,7 @@ class SftDataset(Dataset):
         if actions.shape != (B, cfg.action_chunk, cfg.action_dim):
             raise ValueError("Dataset action shape does not match action_chunk/action_dim")
         padding = action_padding_mask(batch, cfg.action_chunk)
+        supervision = action_supervision_mask(batch, cfg.action_chunk, cfg.action_dim)
         norm_actions = self._normalize(actions, self.action_mask, self.action_min, self.action_max)
         norm_actions = torch.tensor(norm_actions, dtype=torch.bfloat16)
 
@@ -481,6 +482,7 @@ class SftDataset(Dataset):
             "timesteps": time,
             "norm_actions": norm_actions,
             "action_is_pad": padding,
+            "action_supervision_mask": supervision,
             "tactile_f6s": norm_tacf6,
             "tactile_deforms": deforms_tensor,
             "tactile_f6s_delayed": norm_tacf6,       # same as current (delay_k=0)

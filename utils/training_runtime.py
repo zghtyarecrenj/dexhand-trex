@@ -109,7 +109,7 @@ class PolicyLossModule(nn.Module):
         act_pred_start = L_latent + n_fast + n_state + 1
         v_act = raw_model.final_layer(
             hidden[:, act_pred_start: act_pred_start + chunk, :])
-        loss_act = masked_flow_mse(v_act, target, batch.get("action_is_pad"))
+        loss_act = masked_flow_mse(v_act, target, batch.get("action_is_pad"), batch.get("action_supervision_mask"))
 
         if has_any_tac and not is_stage1:
             fe = fast_embeds if n_fast > 0 else None
@@ -184,7 +184,7 @@ class PolicyLossModule(nn.Module):
                     tactile_codes=tac_codes_in,
                     tactile_f6_history=tac_hist_in,
                 ),
-                v_target_r, batch.get("action_is_pad"),
+                v_target_r, batch.get("action_is_pad"), batch.get("action_supervision_mask"),
             )
         else:
             loss_tac = 0.0

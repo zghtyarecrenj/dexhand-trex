@@ -176,6 +176,26 @@ def calculate_stats(data: np.ndarray, mask: Optional[List[bool]] = None) -> dict
     }
 
 
+def supervised_action_stats(actions, padding, axes):
+    """Fit each axis using valid targets selected by the dataset loss masks."""
+    actions, padding, axes = map(np.asarray, (actions, padding, axes))
+    if actions.ndim != 3 or padding.shape != actions.shape[:2] or axes.shape != (actions.shape[0], actions.shape[2]):
+        raise ValueError('Invalid action statistics mask shapes')
+    if padding.dtype != bool or axes.dtype != bool:
+        raise ValueError('Action statistics masks must be boolean')
+    valid = (~padding)[..., None] & axes[:, None, :]
+    result = {k: [] for k in ('mean', 'std', 'max', 'min', 'q01', 'q99')}
+    for axis in range(actions.shape[-1]):
+        values = actions[..., axis][valid[..., axis]]
+        if not len(values):
+            raise ValueError(f'No supervised targets for action axis {axis}; include full demonstrations or use compatible existing statistics')
+        block = calculate_stats(values, [True])
+        for key in result:
+            result[key].append(block[key])
+    result['mask'] = [True]*actions.shape[-1]
+    return result
+
+
 class NormStatsAccumulator:
     """Accumulates per-frame action(chunk)/state/tactile_f6 + per-episode
     tracking errors across a whole dataset, then writes meta/trex_norm_stats.json

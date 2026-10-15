@@ -57,6 +57,16 @@ class RightOnlyTrainingTests(unittest.TestCase):
         check_cascaded_backward(torch.randn(2,16,31),torch.randn(2,5,6),pad,
                                torch.rand(2,5,1,240,240))
 
+    def test_actual_cascaded_model_masks_g_hand_in_both_heads(self):
+        pad=torch.zeros(2,16,dtype=torch.bool); pad[:,8:]=True
+        mask=torch.ones(2,16,31,dtype=torch.bool); mask[1,:,9:]=False
+        check_cascaded_backward(torch.randn(2,16,31),torch.randn(2,5,6),pad, supervision=mask)
+
+    def test_actual_cascaded_model_preserves_internal_handoff_holes(self):
+        pad=torch.zeros(2,16,dtype=torch.bool); pad[:,[3,11]]=True
+        check_cascaded_backward(torch.randn(2,16,31),torch.randn(2,5,6),pad,
+                               supervision=torch.ones(2,16,31,dtype=torch.bool))
+
     def test_single_and_bimanual_vqvae_normalization_and_code_counts(self):
         for dim,nf in ((31,5),(62,10)):
             for granularity in ('hand','finger'):
@@ -83,6 +93,26 @@ class RightOnlyTrainingTests(unittest.TestCase):
         model.load_tactile_vqvae(blob,stats_hand='right')
         self.assertTrue(torch.all(model.tacf6_vqvae_min==-4))
         self.assertTrue(torch.all(model.tacf6_vqvae_max==4))
+
+    def test_json_collator_carries_mixed_axis_masks_to_loss_batch(self):
+        from transformers import BatchEncoding
+        class Processor:
+            tokenizer=SimpleNamespace(pad_token_id=0)
+            def apply_chat_template(self, *a, **k): return 'fixture'
+            def __call__(self, **k): return BatchEncoding({'input_ids':torch.tensor([[1,2]])})
+        ds=object.__new__(trainer.SftDataset)
+        ds.config=SimpleNamespace(action_chunk=16,action_dim=31,use_tactile_vec=0,
+            use_tactile_deform=0,use_robot_state=0,use_flare=0,flare_frame_stride=1)
+        ds.action_mask=np.ones(31,bool);ds.action_min=np.zeros(31);ds.action_max=np.ones(31)
+        ds.processor=Processor()
+        rows=[{'action':np.zeros((16,31)).tolist(), 'action_supervision_mask':None},
+              {'action':np.ones((16,31)).tolist(), 'action_supervision_mask':[True]*9+[False]*22}]
+        batch=ds.collate_fn(rows)
+        mask=batch['action_supervision_mask']
+        self.assertEqual(tuple(mask.shape),(2,16,31))
+        self.assertTrue(mask[0].all())
+        self.assertTrue(mask[1,:,:9].all())
+        self.assertFalse(mask[1,:,9:].any())
 
     def test_json_split_keeps_original_demonstrations_together(self):
         ds=object.__new__(trainer.SftDataset)
