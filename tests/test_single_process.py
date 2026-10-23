@@ -1,6 +1,8 @@
 """Exercise the standalone trainer's real loss/optimizer/validation/save path."""
 import importlib.util
+from contextlib import ExitStack
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -78,7 +80,10 @@ class SingleProcessTests(unittest.TestCase):
     def test_accumulation_flushes_short_final_group_with_activation_checkpointing(self):
         self._exercise_training(accumulation=2, batch_size=1)
 
-    def _exercise_training(self, accumulation, batch_size):
+    def test_mixed_metrics_with_gradient_clipping_disabled(self):
+        self._exercise_training(accumulation=1, batch_size=4, mixed=True)
+
+    def _exercise_training(self, accumulation, batch_size, mixed=False):
         model = small_model()
         # Synthetic vision embeddings; the MoT and both expert heads are real.
         model.prepare_inputs_embeds = MethodType(
@@ -103,12 +108,31 @@ class SingleProcessTests(unittest.TestCase):
                           'source_size':[640,480],'roi':[100,80,400,300]}})
             (Path(tmp)/'image_preprocessing.json').write_text(json.dumps(crop))
             before = model.final_layer.mlp.fc2.weight.detach().clone()
-            with patch.object(trainer, 'Accelerator', side_effect=lambda **kw: Accelerator(cpu=True, **kw)), \
+            with ExitStack() as stack, \
+                 patch.object(trainer, 'Accelerator', side_effect=lambda **kw: Accelerator(cpu=True, **kw)), \
                  patch.object(trainer.Qwen3VLVLAModel, 'from_pretrained_qwen3vl', return_value=model), \
                  patch.object(trainer.AutoProcessor, 'from_pretrained', return_value=proc), \
                  patch.object(trainer, 'SftDataset', TinyDataset), \
                  patch.object(trainer, 'enable_qwen_patch_channels_last', return_value=0), \
                  patch.object(trainer.wandb, 'init'), patch.object(trainer.wandb, 'log') as log:
+                if mixed:
+                    from utils.mixed_data import MixedBatchSampler, RankLoader
+                    args.mixed_data = True
+                    args.max_grad_norm = 0
+
+                    def synthetic_loaders(dataset, accelerator, config):
+                        def collate(rows):
+                            batch = dataset.collate_fn(rows)
+                            batch['dataset_id'] = torch.tensor([int(i == 3) for i in rows])
+                            return batch
+
+                        loader = RankLoader(dataset, batch_sampler=MixedBatchSampler(
+                            [0, 1, 2], [3], 4, 0, 1, 2), collate_fn=collate)
+                        return loader, loader
+
+                    # Isolate the mixed training/metrics path on a single CPU;
+                    # distributed loader contracts are tested separately.
+                    stack.enter_context(patch('utils.mixed_data.build_loaders', synthetic_loaders))
                 trainer.train(args)
             ckpt = Path(tmp)/'checkpoint-0-2'
             self.assertTrue((ckpt/'model.pt').is_file())
@@ -118,6 +142,13 @@ class SingleProcessTests(unittest.TestCase):
             self.assertFalse(torch.equal(before, model.final_layer.mlp.fc2.weight))
             self.assertTrue(any('val/action_loss' in c.args[0] for c in log.call_args_list))
             self.assertTrue(all(torch.isfinite(p).all() for p in model.parameters()))
+            if mixed:
+                metrics = [json.loads(line) for line in (Path(tmp)/'metrics.jsonl').read_text().splitlines()]
+                updates = [m for m in metrics if m['kind'] == 'train']
+                self.assertEqual(len(updates), 2)
+                self.assertEqual(updates[-1]['sampled/original'], 6)
+                self.assertEqual(updates[-1]['sampled/dagger'], 2)
+                self.assertTrue(all(math.isfinite(m['grad_norm']) for m in updates))
 
 
 if __name__ == '__main__':
