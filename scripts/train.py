@@ -122,6 +122,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 class SftDataset(Dataset):
     def __init__(self, config, processor, accelerator):
         self.config = config
+        self.training = True
         self.processor = processor
         self.accelerator = accelerator
 
@@ -258,6 +259,7 @@ class SftDataset(Dataset):
             train_indices = sorted(perm[n_val:].tolist())
 
         val_ds = copy.copy(self)
+        val_ds.training = False  # Validation uses clean measured robot state.
         val_ds.hf_dataset = self.hf_dataset.select(val_indices)
 
         self.hf_dataset = self.hf_dataset.select(train_indices)
@@ -268,6 +270,12 @@ class SftDataset(Dataset):
         return val_ds
 
     def __getitem__(self, idx):
+        if idx == -1 and getattr(self.config, "mixed_data", False):
+            row = dict(self.hf_dataset[0])
+            row["action_is_pad"] = [True] * self.config.action_chunk
+            row["_validation_padding"] = True
+            row["mixed_row_id"] = "distributed-padding"
+            return row
         return self.hf_dataset[idx]
 
     @staticmethod
@@ -321,6 +329,21 @@ class SftDataset(Dataset):
             return None
 
     def collate_fn(self, batch: List[Dict]) -> Dict:
+        if not getattr(self.config, "mixed_data", False):
+            return self._collate(batch)
+        from utils.mixed_data import fixed_randomness, validation_seed
+        if self.training:
+            result = self._collate(batch)
+        else:
+            seed = validation_seed(batch)
+            with fixed_randomness(seed):
+                result = self._collate(batch)
+            result["validation_rng_seed"] = seed
+        result["dataset_id"] = torch.tensor([0 if r["dataset_id"]=="original" else 1 for r in batch])
+        result["metric_real_rows"] = torch.tensor([not r.get("_validation_padding", False) for r in batch])
+        return result
+
+    def _collate(self, batch: List[Dict]) -> Dict:
         cfg = self.config
         B = len(batch)
 
@@ -382,9 +405,10 @@ class SftDataset(Dataset):
         if cfg.use_robot_state:
             for x in batch:
                 state_raw = np.array(x["state_fast"], dtype=np.float32)
-                state_raw = add_tracking_error_noise(state_raw,
-                                                     self.te_mean, self.te_std,
-                                                     cfg.action_dim)
+                if self.training:
+                    state_raw = add_tracking_error_noise(state_raw,
+                                                         self.te_mean, self.te_std,
+                                                         cfg.action_dim)
                 norm_state = self._normalize(state_raw, self.state_mask,
                                      self.state_min, self.state_max)
                 state_raw_list.append(torch.tensor(norm_state, dtype=torch.bfloat16))
@@ -552,6 +576,9 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
 
         with open(os.path.join(save_dir, "stats_data.json"), "w") as f:
             json.dump(stats_data, f, indent=2)
+        if args.mixed_data:
+            with open(os.path.join(save_dir, "experiment_args.json"), "w") as f:
+                json.dump(vars(args), f, indent=2)
 
     accelerator.wait_for_everyone()
     logger.info(f"Checkpoint {epoch}-{global_step} saved.")
@@ -593,6 +620,9 @@ class TrainingMetrics:
 
 @torch.no_grad()
 def run_validation(model, val_dataloader, accelerator, args, *unused):
+    if isinstance(val_dataloader, dict):
+        from utils.mixed_data import run_validation as mixed_validation
+        return mixed_validation(model, val_dataloader, accelerator, args)
     model.eval()
     totals = torch.zeros(3, device=accelerator.device)
     for i, batch in enumerate(val_dataloader):
@@ -757,6 +787,9 @@ def train(args):
                 k.startswith(("tactile_vqvae.", "tacf6_vqvae_")) for k in missing):
             raise ValueError("Resume checkpoint does not contain complete VQ-VAE weights and normalization")
         accelerator.print(f"Resumed: missing={len(missing)}, unexpected={len(unexpected)}")
+        if args.mixed_data and (missing or unexpected or skipped):
+            raise ValueError("Mixed experiment requires an exact, complete warm-start")
+        del resume_sd, filtered_sd, model_sd
 
     if args.init_checkpoint:
         source = torch.load(os.path.join(args.init_checkpoint, "model.pt"),
@@ -825,37 +858,60 @@ def train(args):
     else:
         dataset = SftDataset(args, processor, accelerator)
 
-    val_dataloader = None
-    if getattr(args, "val_ratio", 0) > 0:
-        val_dataset = dataset.create_val_split(
-            val_ratio=args.val_ratio, seed=args.seed)
-        val_dataloader = DataLoader(
-            val_dataset, batch_size=args.train_bsz_per_gpu, shuffle=False,
-            drop_last=False, collate_fn=val_dataset.collate_fn,
-            num_workers=args.num_workers, pin_memory=True)
-
-    dataloader = DataLoader(
-        dataset, batch_size=args.train_bsz_per_gpu, shuffle=True,
-        collate_fn=dataset.collate_fn, num_workers=args.num_workers, pin_memory=True,
-    )
-
-    if args.distributed_backend == "fsdp":
+    if args.mixed_data:
+        from utils.mixed_data import build_loaders, write_metrics, sampling_counts
+        from accelerate.utils import send_to_device
+        dataloader, val_dataloader = build_loaders(dataset, accelerator, args)
         optimizer = accelerator.prepare_optimizer(optimizer)
-        dataloader = accelerator.prepare_data_loader(dataloader)
-        if val_dataloader is not None:
-            val_dataloader = accelerator.prepare_data_loader(val_dataloader)
-    elif val_dataloader is not None:
-        model, optimizer, dataloader, val_dataloader = accelerator.prepare(
-            model, optimizer, dataloader, val_dataloader)
+        observed_samples = torch.zeros(2, device=accelerator.device, dtype=torch.int64)
     else:
-        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+        val_dataloader = None
+        if getattr(args, "val_ratio", 0) > 0:
+            val_dataset = dataset.create_val_split(
+                val_ratio=args.val_ratio, seed=args.seed)
+            val_dataloader = DataLoader(
+                val_dataset, batch_size=args.train_bsz_per_gpu, shuffle=False,
+                drop_last=False, collate_fn=val_dataset.collate_fn,
+                num_workers=args.num_workers, pin_memory=True)
+
+        dataloader = DataLoader(
+            dataset, batch_size=args.train_bsz_per_gpu, shuffle=True,
+            collate_fn=dataset.collate_fn, num_workers=args.num_workers, pin_memory=True,
+        )
+
+        if args.distributed_backend == "fsdp":
+            optimizer = accelerator.prepare_optimizer(optimizer)
+            dataloader = accelerator.prepare_data_loader(dataloader)
+            if val_dataloader is not None:
+                val_dataloader = accelerator.prepare_data_loader(val_dataloader)
+        elif val_dataloader is not None:
+            model, optimizer, dataloader, val_dataloader = accelerator.prepare(
+                model, optimizer, dataloader, val_dataloader)
+        else:
+            model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     num_training_steps = math.ceil(len(dataloader) / args.gradient_accumulation_steps) * args.n_epochs
     if args.max_steps > 0:
         num_training_steps = min(num_training_steps, args.max_steps)
     lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(args.warmup_rates * num_training_steps),
+        optimizer, num_warmup_steps=(args.warmup_updates if args.warmup_updates >= 0 else int(args.warmup_rates * num_training_steps)),
         num_training_steps=num_training_steps, min_lr_ratio=args.min_lr_ratio)
+
+    validation_guard = None
+    if args.guard_min_steps > 0 and not (args.mixed_data and args.eval_at_start):
+        raise ValueError("Coverage guard requires mixed data and initial paired evaluation")
+    if args.eval_at_start or args.eval_only:
+        if val_dataloader is None:
+            raise ValueError("Initial evaluation requires validation data")
+        val_m = run_validation(model, val_dataloader, accelerator, args)
+        accelerator.print(f"[Val step=0] {val_m}")
+        if args.mixed_data:
+            write_metrics(args, accelerator, 0, "validation", val_m)
+        if args.eval_only:
+            return
+        if args.guard_min_steps > 0:
+            from utils.validation_guard import ValidationGuard
+            validation_guard = ValidationGuard(val_m, args.guard_min_steps, args.guard_patience)
 
     metric = TrainingMetrics(device=accelerator.device)
     global_step = 0
@@ -865,6 +921,9 @@ def train(args):
         dataloader.set_epoch(epoch)
         it = tqdm(dataloader, disable=not accelerator.is_main_process)
         for batch_index, batch in enumerate(it):
+            if args.mixed_data:
+                batch = send_to_device(batch, accelerator.device)
+                counts = sampling_counts(batch, accelerator, observed_samples)
             # Accelerator divides by the requested accumulation length. Correct
             # the final shorter group when the loader length is not divisible.
             group_start = (batch_index // args.gradient_accumulation_steps) * args.gradient_accumulation_steps
@@ -873,26 +932,48 @@ def train(args):
                 with accelerator.autocast():
                     outputs = model(batch)
                     loss = outputs["loss"]
+                    if not torch.isfinite(loss):
+                        raise RuntimeError("Nonfinite training loss")
                 metric.update(loss, outputs["action_loss"], outputs["tactile_loss"], outputs["flare_loss"])
                 accelerator.backward(loss * args.gradient_accumulation_steps / group_size)
-                if accelerator.sync_gradients and args.max_grad_norm > 0:
-                    clip_grad_norm(model, accelerator, args.max_grad_norm)
+                if accelerator.sync_gradients and (args.max_grad_norm > 0 or args.mixed_data):
+                    # Mixed metrics still need a norm when clipping is disabled.
+                    max_norm = args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
+                    grad_norm = clip_grad_norm(model, accelerator, max_norm)
+                    if args.mixed_data and not torch.isfinite(grad_norm):
+                        raise RuntimeError("Nonfinite gradient norm")
                 optimizer.step()
                 optimizer.zero_grad()
                 if accelerator.sync_gradients:
                     lr_scheduler.step()
                     global_step += 1
                     m = metric.get_metric()
+                    if args.mixed_data:
+                        m.update(counts, grad_norm=float(grad_norm), lr=lr_scheduler.get_last_lr()[0])
+                        write_metrics(args, accelerator, global_step, "train", m)
                     if accelerator.is_main_process:
                         m["lr"] = lr_scheduler.get_last_lr()[0]
                         it.set_postfix(step=global_step, loss=f"{m['total_loss']:.6f}")
                         wandb.log(m, step=global_step)
             if accelerator.sync_gradients:
-                if val_dataloader is not None and args.val_freq > 0 and global_step % args.val_freq == 0:
+                requested_save = global_step in args.save_steps
+                if val_dataloader is not None and ((args.val_freq > 0 and global_step % args.val_freq == 0) or requested_save):
                     val_m = run_validation(model, val_dataloader, accelerator, args)
                     if accelerator.is_main_process:
                         accelerator.print(f"[Val step={global_step}] {val_m}")
                         wandb.log(val_m, step=global_step)
+                    if args.mixed_data:
+                        write_metrics(args, accelerator, global_step, "validation", val_m)
+                    if validation_guard is not None:
+                        decision = validation_guard.update(global_step, val_m)
+                        # All ranks see the same all-reduced validation metrics.
+                        write_metrics(args, accelerator, global_step, "guard", decision)
+                        if decision["stop"]:
+                            save_checkpoint(model, processor, accelerator, args, epoch, global_step, dataset.stats_data)
+                            accelerator.print(f"[Early stop] {decision}")
+                            return
+                if requested_save and not (args.max_steps > 0 and global_step >= args.max_steps):
+                    save_checkpoint(model, processor, accelerator, args, epoch, global_step, dataset.stats_data)
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     save_checkpoint(model, processor, accelerator, args, epoch, global_step, dataset.stats_data)
                     return
@@ -907,6 +988,15 @@ def build_parser():
     parser.add_argument("--run_name", type=str, default="run_1")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, default="")
+    parser.add_argument("--mixed_data", action="store_true")
+    parser.add_argument("--mixed_steps_per_epoch", type=int, default=800)
+    parser.add_argument("--validation_seed", type=int, default=1729)
+    parser.add_argument("--warmup_updates", type=int, default=-1)
+    parser.add_argument("--guard_min_steps", type=int, default=0)
+    parser.add_argument("--guard_patience", type=int, default=4)
+    parser.add_argument("--eval_at_start", action="store_true")
+    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--save_steps", type=int, nargs="*", default=[])
     parser.add_argument("--stats_path", type=str, default="", help="JSON normalization statistics override (e.g. training sources only)")
     parser.add_argument("--data_root", type=str, default="")
     # Data source: legacy JSON (default) or a LeRobot v3.0 dataset directory.

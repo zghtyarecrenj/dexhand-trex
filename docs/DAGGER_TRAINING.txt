@@ -1,5 +1,40 @@
 T-Rex successful-continuous DAgger training handoff — 2026-10-15
 
+Mixed original/DAgger replay (B300 extension)
+The optional --mixed_data path consumes a JSON/JSONL dataset containing both
+pools with explicit dataset_id (original or dagger), split (train or val),
+source_episode_id namespaced by dataset_id + ':', and a stable mixed_row_id.
+Each pool must have training and validation rows. A source cannot cross splits.
+Prepare and audit these fields before training; the experiment-specific data
+preparation scripts and private exports are not part of this repository.
+
+Use native --distributed_backend fsdp, --gradient_accumulation_steps 1, and a
+per-rank batch divisible by four. Each batch contains exactly 75% original and
+25% DAgger rows. --mixed_steps_per_epoch defines the number of global batches;
+it is not one pass through either pool. Pools cycle without replacement within
+each cycle and are independently reshuffled on exhaustion. For uninterrupted
+coverage, set one sampler epoch long enough to cover both pools.
+
+Keep compatible checkpoint normalization via --stats_path. Mixed warm-starts
+reject missing, unexpected, or mismatched tensors; optimizer and scheduler
+state are not resumed. --warmup_updates overrides the fractional warmup.
+Validation uses clean state, paired flow randomness, separate pool metrics,
+and masked padding so every real row is counted once in a full evaluation.
+Use --max_val_batches 0 for complete validation. Training state augmentation
+and the existing masked expert losses are retained.
+
+--eval_at_start records a baseline; --eval_only evaluates without updates.
+--save_steps accepts explicit optimizer-update indices. Optional
+--guard_min_steps and --guard_patience enable the experimental retention and
+plateau guard after initial paired evaluation. The guard's 5%/20% loss bands
+are offline screening heuristics, not robot success guarantees. See
+utils/validation_guard.py for the exact criteria. Metrics go to metrics.jsonl;
+mixed checkpoints also retain experiment_args.json.
+
+CPU verification (in an environment with the training dependencies):
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 python -m pytest -q tests
+The CUDA patch-layout test is skipped when GPUs are hidden.
+
 Objective
 Fine-tune a compatible right-only T-Rex checkpoint on oct14_15_success_continuous_v4: 123 operator-confirmed successful episodes, 65,810 observations, 63,933 valid action frames and 1,877 masked handoff-context frames. Preserve continuous future chunks across human/policy ownership changes. No training has been launched.
 
