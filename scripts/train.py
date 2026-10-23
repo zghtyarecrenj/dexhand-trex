@@ -121,6 +121,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 class SftDataset(Dataset):
     def __init__(self, config, processor, accelerator):
+        self.is_validation = False
         self.config = config
         self.processor = processor
         self.accelerator = accelerator
@@ -244,7 +245,13 @@ class SftDataset(Dataset):
         """Split the dataset into train/val. Returns a new SftDataset for val."""
         import copy
         n = len(self.hf_dataset)
-        if "source_episode_id" in self.hf_dataset.column_names:
+        if os.environ.get('CHALK_VALIDATION_SOURCES'):
+            heldout = set(json.loads(os.environ['CHALK_VALIDATION_SOURCES']))
+            sources = self.hf_dataset['source_episode_id']
+            train_indices = [i for i,s in enumerate(sources) if s not in heldout]
+            val_indices = [i for i,s in enumerate(sources) if s in heldout]
+            assert train_indices and val_indices and {sources[i] for i in val_indices} == heldout
+        elif "source_episode_id" in self.hf_dataset.column_names:
             from qwen_vla.lerobot_dataset import split_episode_groups
             groups = [{"segment_id": i, "source_index": source}
                       for i, source in enumerate(self.hf_dataset["source_episode_id"])]
@@ -258,6 +265,7 @@ class SftDataset(Dataset):
             train_indices = sorted(perm[n_val:].tolist())
 
         val_ds = copy.copy(self)
+        val_ds.is_validation = True
         val_ds.hf_dataset = self.hf_dataset.select(val_indices)
 
         self.hf_dataset = self.hf_dataset.select(train_indices)
@@ -282,6 +290,11 @@ class SftDataset(Dataset):
         img = PIL.Image.open(os.path.join(self.img_dir, rel_path)).convert("RGB")
         if self.image_size is not None:
             img = img.resize(self.image_size, PIL.Image.LANCZOS)
+        if os.environ.get('CHALK_AUGMENT', 'none') == 'color' and not self.is_validation:
+            from PIL import ImageEnhance
+            # Photometric augmentation only; preserve all camera geometry.
+            for enhancer in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
+                img = enhancer(img).enhance(float(np.random.uniform(0.85, 1.15)))
         return img
 
     def _open_gray(self, path):
@@ -381,9 +394,8 @@ class SftDataset(Dataset):
         if cfg.use_robot_state:
             for x in batch:
                 state_raw = np.array(x["state_fast"], dtype=np.float32)
-                state_raw = add_tracking_error_noise(state_raw,
-                                                     self.te_mean, self.te_std,
-                                                     cfg.action_dim)
+                # Baseline has no observation augmentation; color-only runs leave state unchanged.
+                # Flow-matching action noise remains part of the objective, not data augmentation.
                 norm_state = self._normalize(state_raw, self.state_mask,
                                      self.state_min, self.state_max)
                 state_raw_list.append(torch.tensor(norm_state, dtype=torch.bfloat16))
@@ -815,7 +827,7 @@ def train(args):
                     if p.requires_grad and any(nd in n for nd in no_decay)],
          "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, fused=True, foreach=False)
 
     if getattr(args, "data_format", "json") == "lerobot":
         from qwen_vla.lerobot_dataset import TRexLeRobotDataset

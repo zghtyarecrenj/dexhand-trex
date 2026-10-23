@@ -387,3 +387,23 @@ If you find T-Rex useful, please cite:
 }
 ```
 <!-- TODO: replace the title / author / arXiv id above with the real values. -->
+# B300 tube/chalk experiment snapshot
+
+This branch preserves the tube/chalk trainer variant based on `0e85749`,
+separately from the later mixed original/DAgger replay trainer. Its training
+state has no tracking-error augmentation. Set `CHALK_VALIDATION_SOURCES` to a
+JSON list of source IDs to use an explicit held-out set. Set `CHALK_AUGMENT=color`
+for training-only brightness, contrast and saturation jitter (0.85–1.15);
+validation images retain their original colors and camera geometry is preserved.
+The optimizer uses fused AdamW.
+
+`scripts/train_restart_20261011.py` is the dated experiment continuation entrypoint.
+It adds strict weight loading, memory-mapped checkpoint reads and progress timing.
+Its restart metadata fixes the source history at 6 completed epochs / 116,064
+updates, so those fields apply only to that original experiment. It starts a
+fresh optimizer/schedule and is not exact optimizer-state continuation. Its
+progress timing requires CUDA. Prefer `scripts/train.py` for a fresh experiment;
+do not reuse the dated restart metadata for a different checkpoint.
+
+Datasets, checkpoints, credentials, logs and generated reports are not included
+in this change. CPU regression tests run with `CUDA_VISIBLE_DEVICES=''`.
